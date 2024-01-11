@@ -1,0 +1,192 @@
+From b0dd663edd6ab66ec26c48ff34a52afa040694e6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Petr=20P=C3=ADsa=C5=99?= <ppisar@redhat.com>
+Date: Thu, 22 Jul 2021 15:23:55 +0200
+Subject: [PATCH] Accept 18446744073709551615 buildorder if
+ accept_overflowed_buildorder build boolean is true
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+7c0158bcec05b692d27e37ff46a134f4e294d957 commit (Reject invalid signed
+integers (rpm buildorder), as found in 2.13.0 release, fortified
+parsing signed integers.
+
+It turned out that RHEL 8 delivers a few modules:
+
+container-tools:rhel8:8020120200601155013:ffd2803a
+container-tools:rhel8:8030020200923153805:2a301c24
+container-tools:rhel8:8030020201124131330:830d479e
+container-tools:rhel8:8030120210208205200:c127ee91
+
+which contain an invalid buildorder value 18446744073709551615. DNF
+then warned on loading them into an index and ignored them:
+
+    # dnf module list --repoid pulp-appstream
+    Last metadata expiration check: 3:59:10 ago on Wed 21 Jul 2021 12:38:00 PM CEST.
+    Module yaml error: Failed to parse buildorder in component: 18446744073709551615: The integer value is larger than 9223372036854775807 [line 118 col 9]
+    Module yaml error: Failed to parse buildorder in component: 18446744073709551615: The integer value is larger than 9223372036854775807 [line 118 col 9]
+    Module yaml error: Failed to parse buildorder in component: 18446744073709551615: The integer value is larger than 9223372036854775807 [line 107 col 9]
+    Module yaml error: Failed to parse buildorder in component: 18446744073709551615: The integer value is larger than 9223372036854775807 [line 114 col 9]
+    Module yaml error: Failed to parse buildorder in component: 18446744073709551615: The integer value is larger than 9223372036854775807 [line 118 col 9]
+    Module yaml error: Failed to parse buildorder in component: 18446744073709551615: The integer value is larger than 9223372036854775807 [line 118 col 9]
+    Module yaml error: Failed to parse buildorder in component: 18446744073709551615: The integer value is larger than 9223372036854775807 [line 107 col 9]
+    Module yaml error: Failed to parse buildorder in component: 18446744073709551615: The integer value is larger than 9223372036854775807 [line 114 col 9]
+
+Those were probably built with a broken MBS/libmodulemd which
+loaded -1 and serialized it as an 64-bit unsigned integer
+18446744073709551615.
+
+Because the distributor does not change once-released builds, it
+became impossible to process them with libmodulemd-2.13.0.
+
+This patch adds an accept_overflowed_buildorder build option (disabled
+by default) which enables a workaround to accept 18446744073709551615
+string as -1 integer when parsing 64-bit signed integers. (The type is
+used only in buildorder field now).
+
+(Originally, I developed a more complicated patch only affecting
+loading while keeping validation strict. But that was not enough for
+DNF, creareterepo_c and probably many other tools. Thus I prepared
+even more complicated patch affecting both loading and validation of
+modulemd formats only (cf. modulemd-packager-v3) and that helped DNF.
+But the patch ugglified to code to much and considering it's only
+a temporary hack, I decided for this simple patch which affects
+loading and validation of all formats.)
+
+Petr Písař: Ported to 2.13.0 from
+37a688cc12d7fbab67fda95c47a4605405d7a154.
+
+Signed-off-by: Petr Písař <ppisar@redhat.com>
+---
+ meson.build                                |  1 +
+ meson_options.txt                          |  3 +++
+ modulemd/meson.build                       |  2 ++
+ modulemd/modulemd-yaml-util.c              | 11 +++++++++++
+ modulemd/tests/test-modulemd-parse_int64.c | 15 ++++++++++++++-
+ 5 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/meson.build b/meson.build
+index 37792b3..bbb56ba 100644
+--- a/meson.build
++++ b/meson.build
+@@ -215,6 +215,7 @@ if meson.version().version_compare('>=0.53')
+              'Python 2 Support': get_option('with_py2'),
+              'Python 3 Support': get_option('with_py3'),
+              'Skip Introspection': get_option('skip_introspection'),
++             'Accept overflowed buildorder': get_option('accept_overflowed_buildorder'),
+              'Test Installed Library': get_option('test_installed_lib'),
+             }, section: 'Build Configuration')
+ endif
+diff --git a/meson_options.txt b/meson_options.txt
+index 7873d42..3d84459 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -11,6 +11,9 @@
+ #
+ # REMEMBER TO UPDATE THE SUMMARY() IN meson.build when adding options here
+ 
++option('accept_overflowed_buildorder', type : 'boolean', value: 'false',
++       description : 'Accept overflowed 18446744073709551615 buildorder as -1. This breaks a specification, but some RHEL 8 module builds look like that.')
++
+ option('verbose_tests', type : 'boolean', value : true,
+        description : 'Tests that are run under the "debug" configuration will print all debug messages. Disable this option for valgrind checks, as it speeds it up substantially.')
+ 
+diff --git a/modulemd/meson.build b/modulemd/meson.build
+index 2a60364..0b74818 100644
+--- a/modulemd/meson.build
++++ b/modulemd/meson.build
+@@ -14,6 +14,7 @@
+ test_installed_lib = get_option('test_installed_lib')
+ skip_introspection = get_option('skip_introspection')
+ verbose_tests = get_option('verbose_tests')
++accept_overflowed_buildorder = get_option('accept_overflowed_buildorder')
+ clang_simple_version_script = find_program ('clang_simple_version.sh')
+ 
+ 
+@@ -144,6 +145,7 @@ cdata.set('HAVE_RPMIO', rpm.found())
+ cdata.set('HAVE_LIBMAGIC', magic.found())
+ cdata.set('HAVE_GDATE_AUTOPTR', has_gdate_autoptr)
+ cdata.set('HAVE_EXTEND_AND_STEAL', has_extend_and_steal)
++cdata.set('HAVE_OVERFLOWED_BUILDORDER', accept_overflowed_buildorder)
+ configure_file(
+   output : 'config.h',
+   configuration : cdata
+diff --git a/modulemd/modulemd-yaml-util.c b/modulemd/modulemd-yaml-util.c
+index 6cbf4cc..ad0bd3c 100644
+--- a/modulemd/modulemd-yaml-util.c
++++ b/modulemd/modulemd-yaml-util.c
+@@ -11,6 +11,7 @@
+  * For more information on free software, see <https://www.gnu.org/philosophy/free-sw.en.html>.
+  */
+ 
++#include "config.h"
+ #include "modulemd-errors.h"
+ #include "private/modulemd-subdocument-info-private.h"
+ #include "private/modulemd-util.h"
+@@ -441,6 +442,16 @@ modulemd_yaml_parse_int64 (yaml_parser_t *parser, GError **error)
+ 
+   if ((value == G_MAXINT64 && errno == ERANGE))
+     {
++#ifdef HAVE_OVERFLOWED_BUILDORDER
++      /* A temporary hack. Remove when RHEL 8 goes end of life. */
++      if (g_str_equal ((const gchar *)event.data.scalar.value,
++                       "18446744073709551615"))
++        {
++          g_debug ("Coercing an invalid signed 64-bit integer to -1: %s",
++                   (const gchar *)event.data.scalar.value);
++          return -1;
++        }
++#endif
+       g_set_error (error,
+                    MODULEMD_YAML_ERROR,
+                    MODULEMD_ERROR_VALIDATE,
+diff --git a/modulemd/tests/test-modulemd-parse_int64.c b/modulemd/tests/test-modulemd-parse_int64.c
+index 2ccfb53..8759c21 100644
+--- a/modulemd/tests/test-modulemd-parse_int64.c
++++ b/modulemd/tests/test-modulemd-parse_int64.c
+@@ -11,6 +11,7 @@
+  * For more information on free software, see <https://www.gnu.org/philosophy/free-sw.en.html>.
+  */
+ 
++#include "config.h"
+ #include <glib.h>
+ #include <locale.h>
+ #include <string.h>
+@@ -36,7 +37,7 @@ test (const char *input, gint64 expected_value, gboolean expected_error)
+     g_assert_nonnull (error);
+   else
+     g_assert_null (error);
+-  g_assert_cmpuint (parsed, ==, expected_value);
++  g_assert_cmpint (parsed, ==, expected_value);
+ }
+ 
+ static void
+@@ -69,6 +70,16 @@ test_int64_invalid_too_big (void)
+   test ("9223372036854775808", 0, TRUE);
+ }
+ 
++static void
++test_int64_invalid_overflowed (void)
++{
++#ifdef HAVE_OVERFLOWED_BUILDORDER
++  test ("18446744073709551615", -1, FALSE);
++#else
++  test ("18446744073709551615", 0, TRUE);
++#endif
++}
++
+ static void
+ test_int64_invalid_too_small (void)
+ {
+@@ -143,6 +154,8 @@ main (int argc, char *argv[])
+                    test_int64_invalid_too_big);
+   g_test_add_func ("/modulemd/v2/int64/yaml/parse/invalid_too_small",
+                    test_int64_invalid_too_small);
++  g_test_add_func ("/modulemd/v2/int64/yaml/parse/invalid_overflowed",
++                   test_int64_invalid_overflowed);
+ 
+   g_test_add_func ("/modulemd/v2/uint64/yaml/parse/valid", test_uint64_valid);
+   g_test_add_func ("/modulemd/v2/uint64/yaml/parse/invalid_no_digit",
+-- 
+2.31.1
+
